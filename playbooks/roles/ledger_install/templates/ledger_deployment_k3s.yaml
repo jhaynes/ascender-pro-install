@@ -27,18 +27,14 @@ metadata:
   name: db-settings
   namespace: {{ LEDGER_NAMESPACE }}
 type: Opaque
-{% if k8s_lb_protocol == 'https'  %}
----
-apiVersion: v1
-data:
-  tls.crt: {{ lookup('ansible.builtin.file', tls_crt_path) | b64encode }}
-  tls.key: {{ lookup('ansible.builtin.file', tls_key_path) | b64encode }}
-kind: Secret
-metadata:
-  name: ascender-tls-secret
-  namespace: {{ LEDGER_NAMESPACE }}
-type: kubernetes.io/tls
-{% endif %}
+# homelab fix (#121): do not render a namespace-local TLS Secret here.
+# Upstream built `ascender-tls-secret` from tls_crt_path/tls_key_path when
+# k8s_lb_protocol == https. This cluster terminates TLS for *.alcedo.dev at
+# Traefik via the existing cert-manager wildcard Certificate
+# traefik/wildcard-alcedo-dev served through Traefik's default TLSStore. A
+# Secret is namespace-scoped, so an Ingress in LEDGER_NAMESPACE cannot
+# reference the traefik-owned Secret, and copying the wildcard key material
+# would create an unmanaged, silently-expiring certificate copy.
 ---
 apiVersion: v1
 stringData:
@@ -131,25 +127,6 @@ spec:
     - host: {{ LEDGER_HOSTNAME }}
       http:
         paths:
-{% if k8s_lb_protocol == 'https'  %}
-          # - path: /* # SSL Redirect Setting
-          #   backend:
-          #     service:
-          #       name: : ssl-redirect
-          #       port: 
-          #         name: use-annotation
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: web-svc
-                port:
-                  number: 80
-      tls:
-        - hosts:
-          - {{ LEDGER_HOSTNAME }}
-          secretName: ascender-tls-secret
-{% else %}
         - path: /
           pathType: Prefix
           backend:
@@ -157,7 +134,13 @@ spec:
               name: web-svc
               port:
                 number: 80
-{% endif %}
+# homelab fix (#121): no spec.tls block is rendered here. Upstream placed
+# `tls:` as a sibling key inside spec.rules[0] (invalid per the
+# networking.k8s.io/v1 Ingress API schema) and referenced the
+# namespace-local secret. This Ingress relies on Traefik's default
+# TLSStore (existing cert-manager wildcard Certificate
+# traefik/wildcard-alcedo-dev), so no per-namespace TLS secretName is
+# needed or generated for either k8s_lb_protocol value.
 {% endif %}
 {% if LEDGER_DB_HOST == "db" %}
 ---
@@ -175,6 +158,14 @@ spec:
   resources:
     requests:
       storage: {{ LEDGER_PVC_SIZE_GB }}Gi
+# homelab fix (#121): emit storageClassName from LEDGER_PVC_STORAGE_CLASS.
+# Upstream never consumed the documented variable, so the PVC silently
+# bound to the cluster-default StorageClass (local-path on this cluster,
+# i.e. a directory on a 30G root disk). Omitted entirely when the
+# variable is undefined, preserving upstream behavior for other users.
+{% if LEDGER_PVC_STORAGE_CLASS is defined %}
+  storageClassName: {{ LEDGER_PVC_STORAGE_CLASS }}
+{% endif %}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -199,6 +190,46 @@ spec:
         io.kompose.network/ledger-default: "true"
         io.kompose.service: db
     spec:
+      # homelab fix (#121): pin ledger pods to linux/amd64 nodes. The Pro
+      # ledger-db/parser/web images are linux/amd64 only (verified against
+      # the Depot manifests), and this cluster has mixed amd64 + arm64
+      # (homelab3) workers. Without this pin the scheduler may place a pod
+      # on an arm64 worker and it will ImagePullBackOff.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        # homelab fix (#121, plan A2b2): additionally pin the db Deployment
+        # to one hostname so the mysql-data PVC binds deterministically to
+        # the pre-created tower-raid5-db static PV on that node under
+        # WaitForFirstConsumer (the amd64-only pin would also permit
+        # workers where no MariaDB data PV exists). Hostname comes from
+        # config (LEDGER_DB_NODE_HOSTNAME), not a template literal.
+        kubernetes.io/hostname: {{ LEDGER_DB_NODE_HOSTNAME }}
+      # homelab fix (#121, plan A2b3): fail-closed mount verification.
+      # With a nofail fstab entry the worker can boot with the data disk
+      # absent, leaving an empty root-filesystem directory at the
+      # mountpoint — the exact lookalike hazard. This initContainer runs
+      # before the db container and exits nonzero unless the filesystem
+      # mounted at /var/lib/mysql carries the expected per-host UUID
+      # (recorded at format time by the storage role; findmnt/UUID also
+      # catches swapped scsi devices, not just absent ones). On failure
+      # the pod stays Pending/CrashLoop and never writes into a
+      # root-filesystem lookalike. util-linux (findmnt) is in the Rocky 9
+      # base image.
+      initContainers:
+      - name: verify-mysql-data-mount
+        command:
+        - /bin/sh
+        - -c
+        - >-
+          set -- "$(findmnt -T /var/lib/mysql -n -o UUID,FSTYPE)" || exit 1;
+          [ "$1 $2" = "{{ LEDGER_DB_DATA_FS_UUID }} {{ LEDGER_DB_DATA_FS_FSTYPE | default('ext4') }}" ]
+          || { echo "mysql-data mount mismatch: want {{ LEDGER_DB_DATA_FS_UUID }} {{ LEDGER_DB_DATA_FS_FSTYPE | default('ext4') }}, got $1 $2" >&2; exit 1; }
+        image: {% if LEDGER_DB_IMAGE_REF is defined %}{{ LEDGER_DB_IMAGE_REF }}{% elif k8s_container_registry %}{{ k8s_container_registry | default("depot.ciq.com/ascender-pro/ascender-ledger-pro-images", true) ~ "/ledger-db" }}:{{ LEDGER_VERSION }}{% else %}{{ LEDGER_DB_IMAGE }}:{{ LEDGER_VERSION }}{% endif %}
+        imagePullPolicy: {{ ascender_image_pull_policy | default("Always") }}
+        volumeMounts:
+        - mountPath: /var/lib/mysql
+          name: mysql-data
+          readOnly: true
       containers:
       - env:
         - name: ADMIN_USER
@@ -207,7 +238,9 @@ spec:
           value: /run/secrets/db-ledger-password
         - name: admin-password
           value: /run/secrets/admin-password
-{% if k8s_container_registry %}
+{% if LEDGER_DB_IMAGE_REF is defined %}
+        image: {{ LEDGER_DB_IMAGE_REF }}
+{% elif k8s_container_registry %}
         image: {{ k8s_container_registry | default("depot.ciq.com/ascender-pro/ascender-ledger-pro-images", true)  ~ "/ledger-db" }}:{{ LEDGER_VERSION }}
 {% else %}
         image: {{ LEDGER_DB_IMAGE }}:{{ LEDGER_VERSION }}
@@ -285,11 +318,20 @@ spec:
         io.kompose.network/ledger-default: "true"
         io.kompose.service: parser
     spec:
+      # homelab fix (#121): pin ledger pods to linux/amd64 nodes. The Pro
+      # ledger-db/parser/web images are linux/amd64 only (verified against
+      # the Depot manifests), and this cluster has mixed amd64 + arm64
+      # (homelab3) workers. Without this pin the scheduler may place a pod
+      # on an arm64 worker and it will ImagePullBackOff.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
       - env:
         - name: MYSQL_LEDGER_PASSWORD
           value: /run/secrets/db-ledger-password
-{% if k8s_container_registry %}
+{% if LEDGER_PARSER_IMAGE_REF is defined %}
+        image: {{ LEDGER_PARSER_IMAGE_REF }}
+{% elif k8s_container_registry %}
         image: {{ k8s_container_registry | default("depot.ciq.com/ascender-pro/ascender-ledger-pro-images", true)  ~ "/ledger-parser" }}:{{ LEDGER_VERSION }}
 {% else %}
         image: {{ LEDGER_PARSER_IMAGE }}:{{ LEDGER_VERSION }}
@@ -354,11 +396,20 @@ spec:
         io.kompose.network/ledger-default: "true"
         io.kompose.service: web
     spec:
+      # homelab fix (#121): pin ledger pods to linux/amd64 nodes. The Pro
+      # ledger-db/parser/web images are linux/amd64 only (verified against
+      # the Depot manifests), and this cluster has mixed amd64 + arm64
+      # (homelab3) workers. Without this pin the scheduler may place a pod
+      # on an arm64 worker and it will ImagePullBackOff.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
       - env:
         - name: MYSQL_LEDGER_PASSWORD
           value: /run/secrets/db-ledger-password
-{% if k8s_container_registry %}
+{% if LEDGER_WEB_IMAGE_REF is defined %}
+        image: {{ LEDGER_WEB_IMAGE_REF }}
+{% elif k8s_container_registry %}
         image: {{ k8s_container_registry | default("depot.ciq.com/ascender-pro/ascender-ledger-pro-images", true)  ~ "/ledger-web" }}:{{ LEDGER_VERSION }}
 {% else %}
         image: {{ LEDGER_WEB_IMAGE }}:{{ LEDGER_VERSION }}
