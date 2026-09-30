@@ -381,25 +381,78 @@ check(
      for t in tmpl_tasks],
 )
 
-# ---- A3.7 provisioning disabled (custom.config assertions; here: the
-# guarding flags are honored by the k3s path)
-# The custom.config assertions live in the homelab wrapper role's tests;
-# here we assert the task file's verify flips and the hosts/firewalld
-# guards reference the right flags.
+# ---- A3.7 provisioning disabled (per-task guard assertions; no substring
+# tautologies): every /etc/hosts-write task and the firewalld-stop task in
+# the k3s setup path must carry a `when:` that actually evaluates the
+# relevant config flag (R1 tests-lane finding: comment lines could satisfy
+# the old when-count arithmetic and the flag-name substrings).
 k3s_setup = f"{ROOT}/playbooks/roles/k8s_setup/tasks/k8s_setup_k3s.yml"
 setup_raw = open(k3s_setup).read()
+
+
+def _iter_setup_tasks():
+    for t in yaml.safe_load_all(setup_raw):
+        if not t:
+            continue
+        for item in t:
+            if isinstance(item, dict):
+                yield item
+
+
+setup_tasks = list(_iter_setup_tasks())
+
+
+def _task_repr(task):
+    """Flattened name/module/when text used for guard matching."""
+    parts = [str(task.get("name", ""))]
+    for key, val in task.items():
+        if key in ("name",):
+            continue
+        parts.append(str(val))
+    when = task.get("when")
+    if when is not None:
+        parts.append(str(when))
+    return " ".join(parts)
+
+
+_hosts_write_tasks = [
+    t for t in setup_tasks
+    if isinstance(t.get("ansible.builtin.lineinfile"), dict)
+    and "/etc/hosts" in str(t["ansible.builtin.lineinfile"].get("path", ""))
+]
 check(
-    "A3.7 /etc/hosts writes guarded by use_etc_hosts",
-    "use_etc_hosts" in setup_raw and
-    setup_raw.count("when:") >= setup_raw.count("/etc/hosts") - 1,
+    "A3.7 /etc/hosts writes exist to guard (5 hostname entries)",
+    len(_hosts_write_tasks) == 5,
+    str([t.get("name") for t in _hosts_write_tasks]),
 )
+for t in _hosts_write_tasks:
+    when = str(t.get("when", ""))
+    check(
+        f"A3.7 hosts-write '{t.get('name')}' when-guard references use_etc_hosts",
+        "use_etc_hosts" in when,
+        when,
+    )
+_firewalld_tasks = [
+    t for t in setup_tasks
+    if t.get("ansible.builtin.service")
+    and "firewalld" in str(t["ansible.builtin.service"].get("name", ""))
+]
+check("A3.7 firewalld stop task present", len(_firewalld_tasks) == 1)
+if _firewalld_tasks:
+    when = str(_firewalld_tasks[0].get("when", ""))
+    check(
+        "A3.7 firewalld stop when-guard references firewalld_disable",
+        "firewalld_disable" in when,
+        when,
+    )
+_kubeconfig_tasks = [
+    t for t in setup_tasks
+    if "ansible.builtin.fetch" in t or "ansible.builtin.replace" in t
+]
 check(
-    "A3.7 firewalld stop guarded by firewalld_disable",
-    "firewalld_disable" in setup_raw,
-)
-check(
-    "A3.7 kubeconfig fetch guarded by download_kubeconfig",
-    "download_kubeconfig" in setup_raw,
+    "A3.7 kubeconfig fetch/replace tasks guarded by download_kubeconfig",
+    all("download_kubeconfig" in str(t.get("when", "")) for t in _kubeconfig_tasks),
+    str([(t.get("name"), t.get("when")) for t in _kubeconfig_tasks]),
 )
 
 # ---- A3.8 schema validation (offline structural variant)
@@ -465,11 +518,8 @@ check(
     and reg_doc.get("type") == "kubernetes.io/dockerconfigjson",
 )
 
-# ---- A3.10 TLS-target enumeration
-# every verify_ssl/validate_certs flip must be GONE from the ledger tasks;
-# the served endpoints under our config are the two DNS-resolved public
-# hostnames over http (no TLS), and the kubernetes.core tasks use the
-# kubeconfig CA chain — none targets a non-public-CA endpoint.
+# ---- A3.10 TLS-target enumeration (rendered URLs, not template literals;
+# executed path only — the k3s task files this branch actually runs)
 check(
     "A3.10 no verify_ssl: false left in ledger tasks",
     "verify_ssl: false" not in tasks_raw,
@@ -478,17 +528,52 @@ check(
     "A3.10 no validate_certs: false left in ledger tasks",
     "validate_certs: false" not in tasks_raw,
 )
-# enumerate the uri/module targets from the (now verification-on) tasks:
-# each URL must be a hostname (not a raw node IP / ClusterIP literal)
-uri_targets = [
-    t["ansible.builtin.uri"]["url"]
-    for t in all_tasks if "ansible.builtin.uri" in t
+# executed-path flip enumeration: the R4 chain is setup.yml ->
+# assertions/kubernetes_setup/install_ascender/install_ledger; none of
+# its k3s-path task files may carry a TLS-verification flip (the
+# kubernetes.core tasks ride the kubeconfig CA chain; uri targets are
+# the DNS-resolved hostnames).
+EXEC_PATH_FILES = [
+    f"{ROOT}/playbooks/roles/ascender_install/tasks/ascender_install_k3s.yml",
+    f"{ROOT}/playbooks/install_ledger.yml",
+    f"{ROOT}/playbooks/roles/k8s_setup/tasks/k8s_setup_k3s.yml",
 ]
-for url in uri_targets:
-    check(f"A3.10 uri target '{url}' renders to a DNS hostname "
-          "(no raw node/ClusterIP)",
-          "192.168." not in url and "ledger_ip" in url or "ascender_ip" in url,
-          url)
+for path in EXEC_PATH_FILES:
+    raw = open(path).read()
+    check(
+        f"A3.10 executed-path {path.rsplit('/', 1)[-1]} carries no "
+        "verify_ssl/validate_certs false flip",
+        "verify_ssl: false" not in raw and "validate_certs: false" not in raw,
+        path,
+    )
+# uri targets must RENDER to a hostname (not a raw node IP / ClusterIP
+# literal): render each uri task's url with the fixture context — the
+# context carries the set_fact-derived URL vars exactly as the tasks
+# derive them (ledger_ip = LEDGER_HOSTNAME; ascender_ip = ASCENDER_HOSTNAME
+# under ClusterIP) — and assert no private/loopback literal survives.
+_URI_CTX = base_ctx(
+    ledger_ip="ascender-pro.alcedo.dev",
+    ledger_port="80",
+    ascender_ip="ascender.alcedo.dev",
+    ascender_port="80",
+)
+for t in all_tasks:
+    if "ansible.builtin.uri" not in t:
+        continue
+    url_raw = str(t["ansible.builtin.uri"]["url"])
+    url_rendered = ENV.from_string(url_raw).render(**_URI_CTX)
+    is_private = any(
+        prefix in url_rendered
+        for prefix in ("192.168.", "10.", "127.", "172.16.", "172.17.",
+                       "172.18.", "172.19.", "172.2", "172.30.", "172.31.")
+    )
+    host = url_rendered.split("//")[-1].split(":")[0]
+    check(
+        f"A3.10 uri target '{url_raw}' renders to a DNS hostname "
+        "(no raw node/ClusterIP)",
+        not is_private and "." in host,
+        url_rendered,
+    )
 
 # ---- A2b3 fail-closed initContainer spec
 init = pod_spec["initContainers"][0]
@@ -513,7 +598,14 @@ check(
     init.get("image"),
 )
 
-# ---- additional-spec digest-capable surface
+# ---- additional-spec digest-capable surface (SPLIT form, verified
+# against the operator's own composition semantics)
+PG_IMAGE = "quay.io/sclorg/postgresql-15-c9s@sha256"
+PG_VERSION = "80d861ed8fdd365d6d59e16a0a73c0cd3753cf54664c87e00aab7e78bbe26c39"
+REDIS_IMAGE = "ghcr.io/valkey-io/valkey:9-alpine@sha256"
+REDIS_VERSION = "48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11"
+EE_REF = "ghcr.io/ctrliq/ascender-ee:25.6.2@sha256:c5b300dbeb6405dc068a21d4851b0449ab7b795858656ea7ccc35263fa2aab80"
+PG_SELECTOR = "kubernetes.io/hostname: k3s-worker-4"
 ctx_spec = dict(
     k8s_container_registry="",
     ASCENDER_VERSION="25.6.2",
@@ -522,32 +614,133 @@ ctx_spec = dict(
     ascender_replicas=1,
     k8s_platform="k3s",
     k8s_offline=False,
-    POSTGRES_IMAGE="quay.io/sclorg/postgresql-15-c9s@sha256:3a850891945146b7b69fa52da1b118c265ef67bc0106524f4b3c94df2b470b9b",
-    REDIS_IMAGE="ghcr.io/valkey-io/valkey:9-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11",
-    ASCENDER_EE_IMAGE_REF="ghcr.io/ctrliq/ascender-ee:25.6.2@sha256:c5b300dbeb6405dc068a21d4851b0449ab7b795858656ea7ccc35263fa2aab80",
+    POSTGRES_IMAGE=PG_IMAGE,
+    POSTGRES_IMAGE_VERSION=PG_VERSION,
+    REDIS_IMAGE=REDIS_IMAGE,
+    REDIS_IMAGE_VERSION=REDIS_VERSION,
+    ASCENDER_EE_IMAGE_REF=EE_REF,
+    postgres_selector=PG_SELECTOR,
+    node_selector=PG_SELECTOR,
 )
 spec_out = render(ADDSPEC, ctx_spec)
 spec_digest = spec_out
+
+
+def _parse_spec(rendered):
+    """Parse the additional-spec fragment as the 2-space-indented body of
+    a parent key, then extract it (the fragment is include'd into the AWX
+    CR spec, so it is 2-space-indented YAML without its own document)."""
+    docs = [d for d in yaml.safe_load_all("x:\n" + "".join(
+        "  " + line if line.strip() else line
+        for line in rendered.splitlines(True))) if d]
+    return docs[0]["x"]
+
+
+spec = _parse_spec(spec_out)
 check(
-    "A4/addspec postgres_image carries the digest pin verbatim",
-    "postgres_image: " + str(ctx_spec["POSTGRES_IMAGE"]) in spec_out,
+    "A4/addspec postgres_image is the split-form repo@sha256 prefix",
+    spec.get("postgres_image") == PG_IMAGE,
+    spec.get("postgres_image"),
 )
 check(
-    "A4/addspec postgres_image_version line omitted (undefined)",
-    not _field_present(spec_digest, "postgres_image_version"),
+    "A4/addspec postgres_image_version carries the amd64 child digest hex",
+    spec.get("postgres_image_version") == PG_VERSION,
+    spec.get("postgres_image_version"),
 )
 check(
-    "A4/addspec redis_image carries the digest pin verbatim",
-    "redis_image: " + str(ctx_spec["REDIS_IMAGE"]) in spec_out,
+    "A4/addspec redis_image is the split-form repo:tag@sha256 prefix",
+    spec.get("redis_image") == REDIS_IMAGE,
+    spec.get("redis_image"),
 )
 check(
-    "A4/addspec redis_image_version line omitted (undefined)",
-    not _field_present(spec_digest, "redis_image_version"),
+    "A4/addspec redis_image_version carries the digest hex",
+    spec.get("redis_image_version") == REDIS_VERSION,
+    spec.get("redis_image_version"),
 )
 check(
-    "A4/addspec control_plane_ee_image carries the digest pin verbatim",
-    "control_plane_ee_image: " + str(ctx_spec["ASCENDER_EE_IMAGE_REF"]) in spec_out,
+    "A4/addspec init_container_image is the bare repo (tag+digest stripped)",
+    spec.get("init_container_image") == "ghcr.io/ctrliq/ascender-ee",
+    spec.get("init_container_image"),
 )
+check(
+    "A4/addspec init_container_image_version is tag@digest",
+    spec.get("init_container_image_version") ==
+    "25.6.2@sha256:c5b300dbeb6405dc068a21d4851b0449ab7b795858656ea7ccc35263fa2aab80",
+    spec.get("init_container_image_version"),
+)
+check(
+    "A4/addspec control_plane_ee_image carries the full digest ref verbatim",
+    spec.get("control_plane_ee_image") == EE_REF,
+    spec.get("control_plane_ee_image"),
+)
+check(
+    "A4/addspec CR carries postgres_selector hostname pin (plan B3/B4)",
+    str(spec.get("postgres_selector", "")).strip() == PG_SELECTOR,
+    spec.get("postgres_selector"),
+)
+check(
+    "A4/addspec CR carries node_selector hostname pin",
+    str(spec.get("node_selector", "")).strip() == PG_SELECTOR,
+    spec.get("node_selector"),
+)
+
+# ---- A4/operator composition: apply the operator 25.6.2 image-composition
+# semantics (verified empirically against the operator source at tag
+# 25.6.2 db94583 — database_configuration.yml:59-68,
+# resources_configuration.yml:236-246, set_images.yml:3-18) to the rendered
+# CR fields and assert the EFFECTIVE workload image refs are the frozen
+# full-digest pins. The custom-image branch fires only when the image is
+# non-empty AND the version is defined + non-empty; the composed ref is
+# image + ':' + version; otherwise the operator's default tag-composed
+# ref applies.
+_default_postgres_image = "quay.io/sclorg/postgresql-15-c9s:latest"
+pg_effective = (
+    spec["postgres_image"] + ":" + spec["postgres_image_version"]
+    if spec["postgres_image"] and spec.get("postgres_image_version")
+    else _default_postgres_image
+)
+_default_redis_image = "ghcr.io/valkey-io/valkey:9-alpine"
+redis_effective = (
+    spec["redis_image"] + ":" + spec["redis_image_version"]
+    if spec["redis_image"] and spec.get("redis_image_version")
+    else _default_redis_image
+)
+init_effective = (
+    spec["init_container_image"] + ":" + spec["init_container_image_version"]
+    if spec["init_container_image"] and spec.get("init_container_image_version")
+    else "ghcr.io/ctrliq/ascender-ee:25.6.2"
+)
+check(
+    "A4/comp PG effective ref is the frozen amd64-child digest pin",
+    pg_effective == f"{PG_IMAGE}:{PG_VERSION}",
+    pg_effective,
+)
+check(
+    "A4/comp PG effective ref is not the mutable :latest default",
+    "latest" not in pg_effective and pg_effective != _default_postgres_image,
+    pg_effective,
+)
+check(
+    "A4/comp Valkey effective ref is the frozen digest pin",
+    redis_effective == f"{REDIS_IMAGE}:{REDIS_VERSION}",
+    redis_effective,
+)
+check(
+    "A4/comp EE init-container effective ref is the frozen digest pin",
+    init_effective == EE_REF,
+    init_effective,
+)
+check(
+    "A4/comp EE effective ref contains no double tag",
+    "25.6.2:25.6.2" not in init_effective,
+    init_effective,
+)
+check(
+    "A4/comp all three effective refs are digest-pinned",
+    all("@sha256:" in r for r in (pg_effective, redis_effective, init_effective)),
+    str((pg_effective, redis_effective, init_effective)),
+)
+
 # upstream default behavior preserved when vars undefined
 spec_up = render(ADDSPEC, dict(
     k8s_container_registry="",
@@ -559,17 +752,19 @@ spec_up = render(ADDSPEC, dict(
     k8s_offline=False,
 ))
 check(
-    "A4/addspec upstream defaults preserved (quay postgres repo; version "
-    "line omitted so the operator default :latest applies - same "
-    "effective image as upstream's hard-coded literal)",
+    "A4/addspec upstream defaults preserved (quay postgres repo, bare)",
     "postgres_image: quay.io/sclorg/postgresql-15-c9s" in spec_up
     and not _field_present(spec_up, "postgres_image_version"),
 )
 check(
-    "A4/addspec upstream defaults preserved (valkey repo; version line "
-    "omitted so the operator default :9-alpine applies)",
+    "A4/addspec upstream defaults preserved (valkey repo, bare)",
     "redis_image: ghcr.io/valkey-io/valkey" in spec_up
     and not _field_present(spec_up, "redis_image_version"),
+)
+check(
+    "A4/addspec upstream render omits the CR selectors (opt-in only)",
+    not _field_present(spec_up, "postgres_selector")
+    and not _field_present(spec_up, "node_selector"),
 )
 # tag-form supply still renders the version lines (upstream shape)
 spec_tagged = render(ADDSPEC, dict(

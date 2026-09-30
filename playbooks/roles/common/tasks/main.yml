@@ -16,9 +16,13 @@
      - os_family
 
 - name: Ensure {{ tmp_dir }} exists
+  # homelab fix (#121): rendered manifests written under tmp_dir carry
+  # plaintext Secret stringData (admin password, dockerconfigjson);
+  # owner-only so they are not left world/group readable on disk.
   ansible.builtin.file:
     path: "{{ tmp_dir }}"
     state: directory
+    mode: '0700'
 
 - when: ansible_os_family == "RedHat"
   name: Ensure necessary packages for Enterprise Linux

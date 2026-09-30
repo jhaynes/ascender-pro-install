@@ -14,7 +14,7 @@ reads). FULL digests — a frozen set is not freezable truncated.
 | Ascender | ghcr.io/ctrliq/ascender:25.6.2 | sha256:7f7dec7756285d46f5fb28c4bd03d0728571eeb1f969356dea46d3b003fe9ace (multiarch index) | plan E5 |
 | Ascender EE | ghcr.io/ctrliq/ascender-ee:25.6.2 | sha256:c5b300dbeb6405dc068a21d4851b0449ab7b795858656ea7ccc35263fa2aab80 (manifest list) | plan E5 |
 | Operator | ghcr.io/ctrliq/ascender-operator:25.6.2 (kustomize ref 25.6.2) | sha256:3486e347088dc0c0bd42bcda35b59a8b3bbf3638d2ab9c4cd0e3f9440af842df (multiarch index) | plan E5 |
-| PostgreSQL (operator-managed) | quay.io/sclorg/postgresql-15-c9s | latest index digest sha256:3a850891945146b7b69fa52da1b118c265ef67bc0106524f4b3c94df2b470b9b (multiarch) | plan E5 |
+| PostgreSQL (operator-managed) | quay.io/sclorg/postgresql-15-c9s | index sha256:3a850891945146b7b69fa52da1b118c265ef67bc0106524f4b3c94df2b470b9b (multiarch); linux/amd64 child sha256:80d861ed8fdd365d6d59e16a0a73c0cd3753cf54664c87e00aab7e78bbe26c39 (the pin the CR carries) | plan E5 + R2 authorized manifest read |
 | Valkey | ghcr.io/valkey-io/valkey:9-alpine | sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11 (multiarch index) | plan E5 |
 
 ## How each pin is expressed at install time
@@ -24,21 +24,38 @@ reads). FULL digests — a frozen set is not freezable truncated.
   the human-readable tag while pinning by digest). `LEDGER_VERSION`
   stays `v1.1.2` for the role's non-restart logic; the restart-to-pull
   condition is digest-aware on this branch.
-- PostgreSQL: the operator 25.6.2 composes `postgres_image` + ':' +
-  `postgres_image_version` only when the version is non-empty (verified
-  in its roles/installer/tasks/database_configuration.yml). Pin form:
-  `POSTGRES_IMAGE: quay.io/sclorg/postgresql-15-c9s@sha256:<amd64 child
-  digest>` with `POSTGRES_IMAGE_VERSION` left undefined (this branch's
-  additional-spec template omits the line when undefined, so the custom
-  ref passes through whole). The amd64 child-manifest digest is
-  recorded by the wrapper role at rollout time from the multiarch index
-  (authorized manifest read); the postgres_selector hostname pin makes
-  the runtime node amd64 either way.
-- Valkey: same mechanism (`REDIS_IMAGE` full digest ref,
-  `REDIS_IMAGE_VERSION` undefined).
-- Ascender EE / init container: `ASCENDER_EE_IMAGE_REF` full digest ref
-  (control_plane_ee_image passes through verbatim in the operator; the
-  init container's image/version fields are split from the same ref).
+- PostgreSQL (SPLIT form — operator-composition-verified at 25.6.2):
+  `POSTGRES_IMAGE: quay.io/sclorg/postgresql-15-c9s@sha256` +
+  `POSTGRES_IMAGE_VERSION: 80d861ed8fdd365d6d59e16a0a73c0cd3753cf54664c87e00aab7e78bbe26c39`
+  (the linux/amd64 child-manifest digest of the multiarch index below,
+  resolved by an authorized anonymous manifest read). The operator's
+  custom-image branch composes `postgres_image + ':' +
+  postgres_image_version` and the effective StatefulSet image is the
+  full immutable ref `quay.io/sclorg/postgresql-15-c9s@sha256:80d861ed…c39`.
+  Do NOT use the omitted-version form: the operator skips the custom
+  branch when the version is undefined and runs the mutable
+  `:latest` fallback (verified empirically against the operator's
+  verbatim set_fact chains; database_configuration.yml:59-68).
+  R4d asserts the pulled imageID digest from the running PG pod.
+- Valkey: same split mechanism — `REDIS_IMAGE:
+  ghcr.io/valkey-io/valkey:9-alpine@sha256` + `REDIS_IMAGE_VERSION:
+  48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11`
+  composes to the full digest ref (resources_configuration.yml:236-246).
+- Ascender EE / init container: `ASCENDER_EE_IMAGE_REF` full digest ref.
+  `control_plane_ee_image` passes through verbatim in the operator (no
+  concatenation). The init container's `init_container_image`/
+  `init_container_image_version` CR fields are split from the same ref
+  (bare repo / `tag@sha256:hex`) so the operator's concat in
+  set_images.yml:3-18 reconstructs the exact full digest ref — NOT the
+  R1 `repo:tag` + version double-tag form, which composed an invalid
+  `ghcr.io/ctrliq/ascender-ee:25.6.2:25.6.2` ref.
+- CR placement selectors (plan B3/B4): custom.config emits
+  `postgres_selector` and `node_selector` as literal-block strings
+  (`kubernetes.io/hostname: k3s-worker-4`); the fork's additional-spec
+  renders them into the AWX CR spec when defined, so the operator's
+  postgres.yaml.j2 applies the nodeSelector to the PG StatefulSet and
+  deployments/*.j2 apply node_selector to the web/task pods. This is
+  the deterministic PG↔PV binding pin under WaitForFirstConsumer.
 - Operator image: kustomize `newTag` is pinned by
   `ASCENDER_OPERATOR_VERSION` (25.6.2); the full digest above is
   asserted at rollout R4d from the running pod imageIDs.

@@ -11,13 +11,14 @@
 {% endif %}
   replicas: {{ ascender_replicas | default(1) }}
 {% if ASCENDER_EE_IMAGE_REF is defined %}
-  init_container_image: {{ ASCENDER_EE_IMAGE_REF.split('@')[0].rstrip(':') }}
+  init_container_image: {{ ASCENDER_EE_IMAGE_REF.rsplit('@', 1)[0].rsplit(':', 1)[0] }}
+  init_container_image_version: {{ ASCENDER_EE_IMAGE_REF.rsplit('@', 1)[0].rsplit(':', 1)[1] | default('', true) }}@{{ ASCENDER_EE_IMAGE_REF.rsplit('@', 1)[1] }}
 {% else %}
   init_container_image: {{ k8s_container_registry | default("ghcr.io/ctrliq", true)  ~ "/ascender-ee" }}
 {% endif %}
 {% if ASCENDER_EE_IMAGE_VERSION is defined %}
   init_container_image_version: {{ ASCENDER_EE_IMAGE_VERSION }}
-{% elif ASCENDER_VERSION is defined %}
+{% elif ASCENDER_VERSION is defined and ASCENDER_EE_IMAGE_REF is not defined %}
   init_container_image_version: {{ ASCENDER_VERSION }}
 {% endif %}
 {% if ASCENDER_EE_IMAGE_REF is defined %}
@@ -25,13 +26,19 @@
 {% else %}
   control_plane_ee_image: {{ k8s_container_registry | default("ghcr.io/ctrliq", true)  ~ "/ascender-ee" }}:{{ ASCENDER_VERSION }}
 {% endif %}
-# homelab (#121, digest-capable): operator 25.6.2 builds the postgres image
-# ref as postgres_image + ':' + postgres_image_version, but ONLY when the
-# version is non-empty; with an empty/omitted version it falls back to the
-# DEFAULT tag-composed ref. To pin by digest, supply the full digest ref in
-# POSTGRES_IMAGE and OMIT POSTGRES_IMAGE_VERSION entirely (undefined), so
-# the operator's custom-image branch sees a single complete ref. Template
-# the version line out when the variable is undefined.
+# homelab (#121, digest-capable, operator-composition-verified): operator
+# 25.6.2 composes each custom image ref as `image + ':' + version` when
+# the version is defined and non-empty (roles/installer/tasks/
+# database_configuration.yml:59-68, resources_configuration.yml:236-246,
+# set_images.yml:3-18 — replicated empirically against those verbatim
+# chains). A full digest ref `repo[:tag]@sha256:<hex>` is therefore
+# expressed in SPLIT form: `postgres_image: repo[:tag]@sha256` with
+# `postgres_image_version: <hex>` (same for redis/EE init), so the
+# operator's own concatenation reconstructs the immutable full ref.
+# The OMITTED-version form (digest ref, no version line) does NOT pin:
+# the PG custom-image branch is skipped and the operator falls back to
+# its default `:latest` tag-composed ref; the redis branch references
+# an undefined version and errors. Do not pin by omitted version.
   postgres_image: {{ POSTGRES_IMAGE | default(k8s_container_registry | default("quay.io", true)  ~ "/sclorg/postgresql-15-c9s") }}
 {% if POSTGRES_IMAGE_VERSION is defined %}
   postgres_image_version: "{{ POSTGRES_IMAGE_VERSION }}"
@@ -49,10 +56,9 @@
 {% if POSTGRES_STORAGE_CLASS is defined %}
   postgres_storage_class: {{ POSTGRES_STORAGE_CLASS }}
 {% endif %}
-# homelab (#121, digest-capable): same shape as postgres_image — the
-# operator builds redis_image + ':' + redis_image_version only when the
-# version is non-empty; omit REDIS_IMAGE_VERSION to pass a full digest
-# ref in REDIS_IMAGE.
+# homelab (#121, digest-capable): same split form as postgres_image —
+# `redis_image: repo[:tag]@sha256` + `redis_image_version: <hex>`
+# reconstructs the full digest ref through the operator's concat.
   redis_image: {{ REDIS_IMAGE | default(k8s_container_registry | default("ghcr.io/valkey-io", true)  ~ "/valkey") }}
 {% if REDIS_IMAGE_VERSION is defined %}
   redis_image_version: "{{ REDIS_IMAGE_VERSION }}"
@@ -73,4 +79,12 @@
     - name: {{ ee.name }}
       image: {{ ee.image}}
 {% endfor %}
+{% endif %}
+{% if postgres_selector is defined %}
+  postgres_selector: |
+    {{ postgres_selector | indent(width=4) }}
+{% endif %}
+{% if node_selector is defined %}
+  node_selector: |
+    {{ node_selector | indent(width=4) }}
 {% endif %}

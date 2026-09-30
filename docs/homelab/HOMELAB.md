@@ -21,12 +21,12 @@ path. #123's owner comment names this repo the execution target.
 | b | image refs tag-only (`{{image}}:{{LEDGER_VERSION}}`); digest not expressible | LEDGER_{DB,PARSER,WEB}_IMAGE_REF full-ref override (repo:tag@sha256:…), precedence over registry/tag composition; upstream behavior preserved when unset | fix(ledger-k3s) |
 | b2 | no nodeSelector/affinity on the three Pro Deployments while images are linux/amd64-only; db would also schedule on workers without a MariaDB PV | nodeSelector arch=amd64 on db/parser/web; db additionally hostname-pinned via LEDGER_DB_NODE_HOSTNAME (config-fed, no template literal) for deterministic tower-raid5-db binding under WaitForFirstConsumer | fix(ledger-k3s) |
 | b3 | a nofail-booted worker with a detached data disk leaves an empty root-filesystem mountpoint — MariaDB would write into the lookalike | fail-closed initContainer (findmnt UUID+FSTYPE vs LEDGER_DB_DATA_FS_UUID, readOnly mount of mysql-data) before the db container | fix(ledger-k3s) |
-| c | auth_token debug print; password/token-bearing tasks unlogged; manifests world-readable in tmp_dir | debug task removed; no_log on the five tasks; mode 0600 on both renders | fix(ledger-k3s: secrets) |
-| c2 | verify_ssl/validate_certs: false on every kubernetes.core/uri task (14 flips) | all flips removed (verification on); kubernetes.core uses the kubeconfig CA chain; uri targets are the DNS-resolved hostnames; LOG_AGGREGATOR_VERIFY_CERT stays false (internal http parser endpoint) | fix(ledger-k3s: tls verify) |
+| c | auth_token debug print; password/token-bearing tasks unlogged; manifests world-readable in tmp_dir | debug task removed; no_log on the five tasks; mode 0600 on both ledger renders (R2: also ascender-deployment-k3s.yml render 0600, ascender-install tmp_dir 0700) | fix(ledger-k3s: secrets) 62996ff |
+| c2 | verify_ssl/validate_certs: false flips across the executed k3s chain (22 upstream: ledger_install_k3s 12, ascender_install_k3s 8, install_ledger 1, k8s_setup 1) | all removed on the executed path (verification on); kubernetes.core uses the kubeconfig CA chain (certificate-authority-data; no insecure-skip-tls-verify); uri targets are the DNS-resolved hostnames; LOG_AGGREGATOR_VERIFY_CERT stays false (internal http parser endpoint); upgrade_postgres.yml (maintenance playbook, outside the R4 setup.sh chain) intentionally untouched — tracked as follow-up | fix(ledger-k3s: tls verify) 62996ff + R2 ascender-side |
 | d | PVC mysql-data emits no storageClassName (LEDGER_PVC_STORAGE_CLASS documented but never consumed) | conditional storageClassName emission; binds tower-raid5-db via custom.config | fix(ledger-k3s) |
 | e | restart-to-pull logic compares LEDGER_VERSION == "latest" (tag-string equality) | digest-aware: restart only when a resolved ref is not digest-pinned | fix(ledger-k3s: tls verify) |
 | f | pro common_packages lacks Debian 12/13 keys → KeyError on the Debian 13 installer host | ported from base c8d252c | fix(common) |
-| g | digest pins not expressible through the operator's CR surface (hard-coded postgres_image_version: "latest", redis_image_version: "9-alpine") | additional-spec template: POSTGRES_IMAGE/REDIS_IMAGE/ASCENDER_EE_IMAGE_REF overrides, version lines templated out when undefined (operator 25.6.2 concatenation compatible) | feat(ascender-spec) |
+| g | digest pins not expressible through the operator's CR surface (hard-coded postgres_image_version: "latest", redis_image_version: "9-alpine"); omitted-version form does NOT pin (R2: operator source + empirical probe — the custom-image branch is skipped, PG falls back to :latest, redis references an undefined version) | additional-spec template: SPLIT-form pins (POSTGRES_IMAGE `repo[:tag]@sha256` + POSTGRES_IMAGE_VERSION `<hex>`; same for REDIS_IMAGE/REDIS_IMAGE_VERSION; EE init image/version split from ASCENDER_EE_IMAGE_REF) so the operator's own `image + ':' + version` concat reconstructs the full digest ref; CR selectors postgres_selector/node_selector rendered when config-defined | feat(ascender-spec) 2704e08 + R2 split-form correction |
 | h | ee_images blank-variable validation missing (base #260) | assertions.yml backport | fix(assertions) |
 
 ## f2 backport decision table (base a737ea8 vs pro 6760535, all differing fixes)
@@ -44,14 +44,44 @@ path. #123's owner comment names this repo the execution target.
 
 ## Operator image-concatenation semantics (verified at 25.6.2)
 
-From the operator repo (roles/installer/tasks/database_configuration.yml,
-resources_configuration.yml, set_images.yml at tag 25.6.2): a custom
-postgres or redis image is composed as `image + ':' + version` only
-when the version is non-empty AND the image is non-empty; an empty or
-omitted version falls back to the default tag-composed ref.
-control_plane_ee_image passes through verbatim (no concatenation).
-This is why the digest pins are expressed as full refs with the
-version field omitted (template drops the line when undefined).
+From the operator repo (roles/installer/tasks/database_configuration.yml
+:59-68, resources_configuration.yml:236-246, set_images.yml:3-18 at tag
+25.6.2, commit db94583 — read directly AND replicated empirically as
+verbatim set_fact chains with the fork's CR values):
+
+- A custom postgres/redis/init image ref is composed as
+  `image + ':' + version` and is USED only when the image is non-empty
+  AND the version is defined and non-empty. Otherwise the operator's
+  default tag-composed ref applies (`quay.io/sclorg/postgresql-15-c9s:
+  latest` for PG; `ghcr.io/valkey-io/valkey:9-alpine` for redis).
+- OMITTED-version digest ref does NOT pin (the R1 branch shape): the PG
+  custom-image set_fact is skipped entirely (postgres_image_version is
+  undefined) and the effective image falls back to the mutable
+  `:latest`; the redis branch's when-clause references the undefined
+  version and errors (or renders an invalid trailing-colon ref under
+  permissive undefined handling). Probes at R1 demonstrated both.
+- SPLIT form DOES pin (the R2 branch shape, empirically verified):
+  `postgres_image: quay.io/sclorg/postgresql-15-c9s@sha256` +
+  `postgres_image_version: <amd64 child digest hex>` composes to the
+  full immutable ref through the operator's own concatenation; same for
+  `redis_image: ghcr.io/valkey-io/valkey:9-alpine@sha256` + hex, and the
+  EE init container (`image: bare-repo` + `version: tag@sha256:hex`).
+  This is how the digest pins are expressed on this branch.
+- `control_plane_ee_image` passes through verbatim (no concatenation).
+- Caveat for anyone re-probing with ansible-core 2.19+: the operator's
+  `when: x | default([]) | length` style conditions are implicit-bool
+  conditionals — legal on the operator's bundled core, but they raise
+  "Conditional result derived from value of type 'int'" on 2.19
+  strictness. That is a local-runner artifact, not operator behavior;
+  re-run probes with ANSIBLE_ALLOW_BROKEN_CONDITIONALS=true or an
+  operator-bundled core.
+
+The earlier R1 text claiming "empty or omitted version falls back to
+the default tag-composed ref, and this is why the digest pins are
+expressed as full refs with the version field omitted" was
+self-contradictory and wrong on the second half: omitted version does
+fall back — which is exactly why it cannot pin. The split form above is
+the corrected, verified mechanism.
 
 ## A8 operator/CRD lifecycle (for the rollout runbook)
 
@@ -100,8 +130,10 @@ captures; BUILD-D wraps or falls back).
 
 ## Validation
 
-- tests/homelab_render_tests.py — 89/89 assertions PASS (A3.1–A3.10,
-  A2b3, A4 additional-spec; see the test commit message for the matrix).
+- tests/homelab_render_tests.py — 109/109 assertions PASS (A3.1–A3.10
+  with per-task guard and rendered-URL checks, A2b3, A4 additional-spec
+  split-form + operator-composition effective-ref checks, CR-selector
+  coverage; the R2 round extended the R1 matrix of 89).
 - ansible-playbook --syntax-check PASS on setup.yml, install_ledger.yml,
   install_ascender.yml, assertions.yml, kubernetes_setup.yml,
   backup.yml, restore.yml.
@@ -110,3 +142,8 @@ captures; BUILD-D wraps or falls back).
 - kubectl --dry-run=client on the rendered manifest: runs on the
   installer VM at rollout (R2/R3 evidence per plan A3.8); the offline
   structural schema variant is in the test matrix.
+- R2 mutation battery on the extended matrix (scratch copies only):
+  hosts-guard drop, firewalld-guard drop, all-guards drop, rendered
+  raw-IP URL, PG digest transposition (ctx-side), CR selector drift,
+  EE double-tag regression, omitted-version PG form, reintroduced
+  verify_ssl flip — all caught (matrix fails), baselines 109/109.

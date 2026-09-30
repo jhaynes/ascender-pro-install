@@ -42,7 +42,6 @@
   kubernetes.core.k8s_info:
     api_version: v1
     kind: Node
-    validate_certs: false
   delegate_to: localhost
   environment:
     K8S_AUTH_KUBECONFIG: "{{ lookup('env', 'HOME') }}/.kube/config"
