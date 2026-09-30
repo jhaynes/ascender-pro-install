@@ -79,10 +79,10 @@ if [ -t "0" ]; then
   ANSIBLE_FORCE_COLORS=True
 fi
 
-if [ -f "$(dirname $0)/inventory.yml" ]; then
-  INVENTORY_FILE="$(dirname $0)/inventory.yml"
+if [ -f "$(dirname "$0")/inventory.yml" ]; then
+  INVENTORY_FILE="$(dirname "$0")/inventory.yml"
 else
-  INVENTORY_FILE="$(dirname $0)/inventory"
+  INVENTORY_FILE="$(dirname "$0")/inventory"
 fi
 
 echo "Using Inventory File: ${INVENTORY_FILE}"
@@ -93,6 +93,41 @@ check_ansible() {
 
 check_python_kubernetes() {
   python3 -c "import kubernetes" > /dev/null 2>&1
+}
+
+# homelab backport (#121, f2): fail here rather than at the first playbook
+# if the ansible-playbook on PATH cannot actually run (ported from base
+# c8d252c; sudo resets PATH through secure_path, dropping an activated
+# virtualenv, so ansible resolved to a system install carrying a pre-3.0
+# Jinja2 and every subsequent call failed with the same opaque error).
+preflight() {
+  type -p ansible-playbook > /dev/null || {
+    echo "Error: ansible-playbook is not on PATH."
+    exit 1
+  }
+
+  if diag=$(ansible-playbook --version 2>&1); then
+    return 0
+  fi
+
+  echo "Error: ansible-playbook on PATH cannot run:"
+  printf '%s\n' "$diag" | sed 's/^/       /'
+  echo "       ansible-playbook: $(type -p ansible-playbook)"
+  echo "       python3:          $(type -p python3)"
+  if [ -n "${SUDO_USER:-}" ]; then
+    echo
+    echo "  You are running under sudo. sudo resets PATH, so an activated"
+    echo "  virtualenv is not visible here. Either run the installer as an"
+    echo "  unprivileged user with passwordless sudo (recommended - every task"
+    echo "  that needs root escalates on its own):"
+    echo
+    echo "      source /path/to/venv/bin/activate && ./setup.sh"
+    echo
+    echo "  or keep the environment when escalating:"
+    echo
+    echo "      sudo -E env \"PATH=\$PATH\" ./setup.sh"
+  fi
+  exit 1
 }
 
 check_collections() {
@@ -129,6 +164,8 @@ if [ $? -ne 0 ]; then
   fi
 fi
 
+preflight
+
 check_collections
 if [ $? -ne 1 ]; then
   echo "#### INSTALLING COLLECTIONS ####"
@@ -147,15 +184,45 @@ if [ $? -ne 0 ]; then
   echo "#### INSTALLING PYTHON KUBERNETES CLIENT ####"
   # We are going to attempt to install the kubernetes client
   # but we don't want this failing to stop us if we are in offline mode
-  if ! python3 -m pip --version > /dev/null 2>&1; then
-    if [[ "$OS" == "debian" ]]; then
-      sudo apt-get update -y && sudo apt-get install -y python3-pip || true
+  # homelab backport (#121, f2, from base c8d252c): Debian marks its
+  # Python install as externally managed (PEP 668), so the old
+  # `python3 -m pip install --user` line is rejected outright and
+  # `--user` is additionally invalid inside a virtualenv. Prefer the
+  # distro python3-kubernetes package, then fall back to pip with flags
+  # that match whichever environment we are in.
+  if [[ "$OS" == "debian" ]]; then
+    sudo apt-get update -y && sudo apt-get install -y python3-kubernetes || true
+  fi
+  if [[ "$OS" == "rhel" ]]; then
+    sudo dnf install -y epel-release || true
+    sudo dnf install -y python3-kubernetes || true
+  fi
+
+  if ! check_python_kubernetes; then
+    if ! python3 -m pip --version > /dev/null 2>&1; then
+      if [[ "$OS" == "debian" ]]; then
+        sudo apt-get update -y && sudo apt-get install -y python3-pip || true
+      fi
+      if [[ "$OS" == "rhel" ]]; then
+        sudo dnf install -y python3-pip || true
+      fi
     fi
-    if [[ "$OS" == "rhel" ]]; then
-      sudo dnf install -y python3-pip || true
+
+    if [ -n "${VIRTUAL_ENV:-}" ]; then
+      # Inside a venv: no --user, and PEP 668 does not apply.
+      python3 -m pip install -U kubernetes || true
+    else
+      python3 -m pip install --user -U kubernetes 2>/dev/null \
+        || python3 -m pip install --user --break-system-packages -U kubernetes \
+        || true
     fi
   fi
-  python3 -m pip install --user kubernetes || true
+
+  if ! check_python_kubernetes; then
+    echo "WARNING: the python kubernetes client is still not importable by $(type -p python3)."
+    echo "         The playbooks install python3-kubernetes on the target as well, so this"
+    echo "         is only fatal if it is still missing when kubernetes.core tasks run."
+  fi
 fi
 
 PASSED_ARG=$@
