@@ -11,15 +11,23 @@
   when: k8s_offline
 
 - name: Generate manifest to install Ledger k8s object with timestamp attached, for purposes of deletion later
+  # homelab fix (#121): the rendered manifest carries plaintext Secret
+  # stringData (LEDGER_ADMIN_PASSWORD, LEDGER_DB_PASSWORD, db config.json).
+  # Restrict to owner-only so it is not left world/group readable on disk.
   ansible.builtin.template:
     src: ledger_deployment_k3s.yaml
     dest: "{{ tmp_dir }}/ledger_deployment_k3s.yaml.{{ ansible_date_time.iso8601_basic_short }}"
+    mode: '0600'
 
 - name: Generate manifest for the Ledger registry secret with timestamp, for purposes of deletion later
   when: DEPOT_REGISTRY.BASE is defined
+  # homelab fix (#121): the rendered manifest carries a plaintext
+  # dockerconfigjson with DEPOT_REGISTRY credentials. Restrict to
+  # owner-only so it is not left world/group readable on disk.
   ansible.builtin.template:
     src: ledger_deployment_registry_secret.yaml
     dest: "{{ tmp_dir }}/ledger_deployment_registry_secret.yaml.{{ ansible_date_time.iso8601_basic_short }}"
+    mode: '0600'
 
 - name: Apply ledger registry secret (if needed) manifest for {{ k8s_platform }}
   when: DEPOT_REGISTRY.BASE is defined
@@ -27,14 +35,12 @@
     state: present
     namespace: "{{ LEDGER_NAMESPACE }}"
     definition: "{{ lookup('template', 'templates/ledger_deployment_registry_secret.yaml') | from_yaml }}"
-    verify_ssl: false
 
 - name: "Apply ledger manifest for {{ k8s_platform }}"
   kubernetes.core.k8s:
     state: present
     namespace: "{{ LEDGER_NAMESPACE }}"
     definition: "{{ lookup('template', 'templates/ledger_deployment_k3s.yaml') | from_yaml_all }}"
-    verify_ssl: false
   register: ledger_apply_result
 
 - name: Wait for Ledger web Deployment to complete setting up
@@ -45,7 +51,6 @@
     namespace: "{{ LEDGER_NAMESPACE }}"
     wait_sleep: 10
     wait_timeout: 360
-    verify_ssl: false
 
 - name: Wait for Ledger parser Service to be up
   kubernetes.core.k8s_info:
@@ -55,7 +60,6 @@
     namespace: "{{ LEDGER_NAMESPACE }}"
     wait_sleep: 10
     wait_timeout: 360
-    verify_ssl: false
   register: parser_svc
       
 - ansible.builtin.debug:
@@ -76,14 +80,23 @@
               kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
     merge_type:
       - strategic-merge
-    verify_ssl: false
   loop:
     - db
     - parser
     - web
   when:
-    - LEDGER_VERSION | lower == "latest"
+    # homelab fix (#121, digest-aware): upstream restarted when
+    # LEDGER_VERSION == "latest" (tag-string equality). With
+    # digest-capable LEDGER_*_IMAGE_REF pinning, a pinned tag still
+    # resolves to an immutable ref, so compare the resolved refs for a
+    # digest instead of comparing the tag string: restart to re-pull only
+    # when any ledger image ref is mutable (not digest-pinned).
     - not ledger_apply_result.changed
+    - >-
+      [LEDGER_DB_IMAGE_REF | default(LEDGER_DB_IMAGE ~ ':' ~ LEDGER_VERSION),
+       LEDGER_PARSER_IMAGE_REF | default(LEDGER_PARSER_IMAGE ~ ':' ~ LEDGER_VERSION),
+       LEDGER_WEB_IMAGE_REF | default(LEDGER_WEB_IMAGE ~ ':' ~ LEDGER_VERSION)]
+      | join(' ') is not search('@sha256:')
 
 - name: Set the Ledger URL
   ansible.builtin.set_fact:
@@ -99,7 +112,6 @@
   ansible.builtin.uri:
     url: "{{ k8s_lb_protocol }}://{{ ledger_ip }}:{{ ledger_port }}"
     return_content: yes
-    validate_certs: false
     status_code:
       - 200
   until: uri_output.status == 200
@@ -122,7 +134,6 @@
   ansible.builtin.uri:
     url: "{{ k8s_lb_protocol }}://{{ ascender_ip }}:{{ ascender_port }}/api/v2/ping/"
     return_content: yes
-    validate_certs: false
     status_code:
       - 200
   until: uri_output.status == 200
@@ -137,13 +148,16 @@
   block:
 
     - name: Check Ledger Token
+      # homelab fix (#121): this task sends LEDGER_ADMIN_PASSWORD in its
+      # request and receives the auth_token in its response; suppress
+      # task/result logging so neither lands in playbook output/logs.
+      no_log: true
       ansible.builtin.uri:
         url: "{{ k8s_lb_protocol }}://{{ ledger_ip }}:{{ ledger_port }}/api/v1/settings/"
         user: admin
         password: "{{ LEDGER_ADMIN_PASSWORD }}"
         force_basic_auth: true
         return_content: yes
-        validate_certs: false
         status_code:
           - 200
       until: (ledger_settings.status | default(0)) == 200
@@ -152,13 +166,16 @@
       register: ledger_settings
 
     - name: Regenerate Token if blank
+      # homelab fix (#121): this task sends LEDGER_ADMIN_PASSWORD in its
+      # request and receives the auth_token in its response; suppress
+      # task/result logging so neither lands in playbook output/logs.
+      no_log: true
       ansible.builtin.uri:
         url: "{{ k8s_lb_protocol }}://{{ ledger_ip }}:{{ ledger_port }}/api/v1/settings/?regenerate_auth_token=1"
         user: admin
         password: "{{ LEDGER_ADMIN_PASSWORD }}"
         force_basic_auth: true
         return_content: yes
-        validate_certs: false
         status_code:
           - 200
       until: (ledger_settings2.status | default(0)) == 200
@@ -168,13 +185,16 @@
       when: ledger_settings.json.auth_token is undefined or ledger_settings.json.auth_token == ""
 
     - name: Get Ledger Token Again (in case of regeneration)
+      # homelab fix (#121): this task sends LEDGER_ADMIN_PASSWORD in its
+      # request and receives the auth_token in its response; suppress
+      # task/result logging so neither lands in playbook output/logs.
+      no_log: true
       ansible.builtin.uri:
         url: "{{ k8s_lb_protocol }}://{{ ledger_ip }}:{{ ledger_port }}/api/v1/settings/"
         user: admin
         password: "{{ LEDGER_ADMIN_PASSWORD }}"
         force_basic_auth: true
         return_content: yes
-        validate_certs: false
         status_code:
           - 200
       until: (ledger_settings.status | default(0)) == 200
@@ -182,10 +202,17 @@
       delay: 10
       register: ledger_settings
 
-    - ansible.builtin.debug:
-        var: ledger_settings.json.auth_token
+    # homelab fix (#121): the upstream task here was
+    # `ansible.builtin.debug: var: ledger_settings.json.auth_token`,
+    # printing the Ledger API auth token in plaintext to playbook
+    # stdout/logs on every run. Removed. The token remains available to
+    # the logging-integration task below via the registered fact.
 
     - name: Enable Require Token
+      # homelab fix (#121): this task sends LEDGER_ADMIN_PASSWORD in its
+      # request and receives the auth_token in its response; suppress
+      # task/result logging so neither lands in playbook output/logs.
+      no_log: true
       ansible.builtin.uri:
         url: "{{ k8s_lb_protocol }}://{{ ledger_ip }}:{{ ledger_port }}/api/v1/settings/"
         user: admin
@@ -195,7 +222,6 @@
         body_format: json
         body: '{ "require_auth_token": 1, "base_url": "{{ k8s_lb_protocol }}://{{ ledger_ip }}:{{ ledger_port }}" }'
         return_content: yes
-        validate_certs: false
         status_code:
           - 200
       register: uri_output
@@ -207,11 +233,14 @@
         - ledger_settings.json.require_auth_token is undefined or ledger_settings.json.require_auth_token == 0
 
 - name: Set all the logging parameters
+  # homelab fix (#121): this task sends ASCENDER_ADMIN_PASSWORD and the
+  # Ledger auth_token (as LOG_AGGREGATOR_PASSWORD) in its module args;
+  # suppress logging so neither is echoed to playbook output.
+  no_log: true
   ctrliq.ascender.settings:
     controller_host: "{{ k8s_lb_protocol }}://{{ ascender_ip }}:{{ ascender_port }}"
     controller_username: "{{ ASCENDER_ADMIN_USER }}"
     controller_password: "{{ ASCENDER_ADMIN_PASSWORD }}"
-    validate_certs: false
     settings:
       LOG_AGGREGATOR_HOST: "http://{{ ledger_parser_ip }}"
       LOG_AGGREGATOR_PORT: "{{ ledger_parser_port }}"
