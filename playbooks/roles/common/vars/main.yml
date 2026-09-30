@@ -19,6 +19,34 @@ common_packages:
       - python3-setuptools
       - kubectl
       - python3-kubernetes
+    # homelab backport (#121, f/A2f): Debian 12/13 keys ported from base
+    # ctrliq/ascender-install c8d252c (#240). The base repo's keyring build
+    # runs a `curl | gpg` pipeline three tasks before common_packages is
+    # installed (kubectl only exists once the k8s apt repo is in place), so
+    # Debian cloud/netinst images — which ship neither curl nor gnupg —
+    # need those packages in this list too. Tower and the disposable
+    # installer VM run Debian 13; without this key the role fails with a
+    # KeyError on the OS-version lookup.
+    12:
+      - git
+      - jq
+      - curl
+      - gnupg
+      - ca-certificates
+      - python3-pip
+      - python3-setuptools
+      - kubectl
+      - python3-kubernetes
+    13:
+      - git
+      - jq
+      - curl
+      - gnupg
+      - ca-certificates
+      - python3-pip
+      - python3-setuptools
+      - kubectl
+      - python3-kubernetes
     24:
       - jq
       - python3-pip
