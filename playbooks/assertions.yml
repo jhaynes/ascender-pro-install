@@ -85,11 +85,19 @@
             fail_msg: "K3s Server OS major version must be 8 or 9"
           when: ansible_os_family == "RedHat"
 
-        - name: Verify Ubuntu OS Family architecture
+        # homelab backport (#121, f2, from base c8d252c): upstream compared
+        # ansible_distribution_major_version as a STRING, so Debian 12/13
+        # evaluated '12' in ['24'] -> False and failed the assertion.
+        # Compare numerically and branch per distribution instead.
+        - name: Verify Debian OS Family version
           ansible.builtin.assert:
             that:
-              - ansible_distribution_major_version == '24'
-            fail_msg: "K3s Server OS major version must be 24"
+              - (ansible_distribution == 'Ubuntu' and ansible_distribution_major_version | int >= 24)
+                or (ansible_distribution == 'Debian' and ansible_distribution_major_version | int >= 12)
+            fail_msg: >-
+              K3s server OS version unsupported: detected
+              {{ ansible_distribution }} {{ ansible_distribution_major_version }}.
+              Ubuntu must be >= 24, Debian must be >= 12.
           when: ansible_os_family == "Debian"
 
         - name: Get mount location of /var directory
