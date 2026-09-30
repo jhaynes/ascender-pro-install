@@ -10,11 +10,32 @@
   image_pull_policy: {{ ascender_image_pull_policy | default("Always") }}
 {% endif %}
   replicas: {{ ascender_replicas | default(1) }}
+{% if ASCENDER_EE_IMAGE_REF is defined %}
+  init_container_image: {{ ASCENDER_EE_IMAGE_REF.split('@')[0].rstrip(':') }}
+{% else %}
   init_container_image: {{ k8s_container_registry | default("ghcr.io/ctrliq", true)  ~ "/ascender-ee" }}
+{% endif %}
+{% if ASCENDER_EE_IMAGE_VERSION is defined %}
+  init_container_image_version: {{ ASCENDER_EE_IMAGE_VERSION }}
+{% elif ASCENDER_VERSION is defined %}
   init_container_image_version: {{ ASCENDER_VERSION }}
+{% endif %}
+{% if ASCENDER_EE_IMAGE_REF is defined %}
+  control_plane_ee_image: {{ ASCENDER_EE_IMAGE_REF }}
+{% else %}
   control_plane_ee_image: {{ k8s_container_registry | default("ghcr.io/ctrliq", true)  ~ "/ascender-ee" }}:{{ ASCENDER_VERSION }}
-  postgres_image: {{ k8s_container_registry | default("quay.io", true)  ~ "/sclorg/postgresql-15-c9s" }}
-  postgres_image_version: "latest"
+{% endif %}
+# homelab (#121, digest-capable): operator 25.6.2 builds the postgres image
+# ref as postgres_image + ':' + postgres_image_version, but ONLY when the
+# version is non-empty; with an empty/omitted version it falls back to the
+# DEFAULT tag-composed ref. To pin by digest, supply the full digest ref in
+# POSTGRES_IMAGE and OMIT POSTGRES_IMAGE_VERSION entirely (undefined), so
+# the operator's custom-image branch sees a single complete ref. Template
+# the version line out when the variable is undefined.
+  postgres_image: {{ POSTGRES_IMAGE | default(k8s_container_registry | default("quay.io", true)  ~ "/sclorg/postgresql-15-c9s") }}
+{% if POSTGRES_IMAGE_VERSION is defined %}
+  postgres_image_version: "{{ POSTGRES_IMAGE_VERSION }}"
+{% endif %}
   postgres_extra_args:
      - '-c'
      - 'shared_buffers=256MB'
@@ -28,8 +49,14 @@
 {% if POSTGRES_STORAGE_CLASS is defined %}
   postgres_storage_class: {{ POSTGRES_STORAGE_CLASS }}
 {% endif %}
-  redis_image: {{ k8s_container_registry | default("ghcr.io/valkey-io", true)  ~ "/valkey" }}
-  redis_image_version: "9-alpine"
+# homelab (#121, digest-capable): same shape as postgres_image — the
+# operator builds redis_image + ':' + redis_image_version only when the
+# version is non-empty; omit REDIS_IMAGE_VERSION to pass a full digest
+# ref in REDIS_IMAGE.
+  redis_image: {{ REDIS_IMAGE | default(k8s_container_registry | default("ghcr.io/valkey-io", true)  ~ "/valkey") }}
+{% if REDIS_IMAGE_VERSION is defined %}
+  redis_image_version: "{{ REDIS_IMAGE_VERSION }}"
+{% endif %}
 {% if k8s_image_pull_secret is defined and k8s_image_pull_secret != 'None' %}
   image_pull_secret: {{ k8s_image_pull_secret }}
 {% endif %}
