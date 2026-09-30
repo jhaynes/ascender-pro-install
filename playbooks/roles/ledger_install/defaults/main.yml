@@ -22,6 +22,27 @@ LEDGER_DB_IMAGE: depot.ciq.com/ascender-pro/ascender-ledger-pro-images/ledger-db
 # The image tag indicating the version of Ledger you wish to install
 LEDGER_VERSION: latest
 
+# homelab addition (#121, digest pinning): full image references for the
+# three Ledger images. When defined, each takes precedence over the
+# LEDGER_*_IMAGE + LEDGER_VERSION tag composition, so an immutable
+# repo:tag@sha256:<digest> reference can be pinned. Leave undefined to
+# keep upstream tag behavior.
+# LEDGER_WEB_IMAGE_REF: ""
+# LEDGER_PARSER_IMAGE_REF: ""
+# LEDGER_DB_IMAGE_REF: ""
+
+# homelab addition (#121, plan A2b2): kubernetes.io/hostname the db
+# Deployment is pinned to, for deterministic tower-raid5-db PV binding
+# under WaitForFirstConsumer. Leave undefined for upstream scheduling.
+# LEDGER_DB_NODE_HOSTNAME: ""
+
+# homelab addition (#121, plan A2b3): per-host filesystem UUID (and type)
+# the fail-closed db initContainer requires on the mysql-data mount,
+# recorded at data-disk format time by the storage role. Leave undefined
+# only when LEDGER_DB_HOST != "db" (no in-cluster db, no PVC mount).
+# LEDGER_DB_DATA_FS_UUID: ""
+# LEDGER_DB_DATA_FS_FSTYPE: ext4
+
 # The Kubernetes namespace in which Ledger objects will live
 LEDGER_NAMESPACE: ledger
 
