@@ -575,6 +575,95 @@ for t in all_tasks:
         url_rendered,
     )
 
+# ---- A3.10b URL-source set_facts (R2 tests N1; the R1-F8 remainder):
+# the A3.10 uri checks above render URL templates with a FIXTURE
+# ledger_ip / ascender_ip, so a regression that assigns a ClusterIP /
+# service-resource literal into those vars never exercises the set_fact
+# body and escapes the matrix. Parse the executed-path task files and
+# assert every *_ip assignment derives from the DNS hostname vars (or
+# from ledger_ip, itself hostname-derived) — never from a ClusterIP /
+# resource-spec expression.
+URL_SOURCE_FILES = [
+    (f"{ROOT}/playbooks/roles/ledger_install/tasks/ledger_install_k3s.yml",
+     ("ledger_ip", "ascender_ip")),
+    (f"{ROOT}/playbooks/roles/ascender_install/tasks/ascender_install_k3s.yml",
+     ("ascender_ip",)),
+]
+for _path, _url_vars in URL_SOURCE_FILES:
+    _fname = _path.rsplit("/", 1)[-1]
+    _docs = [d for d in yaml.safe_load_all(open(_path).read()) if d]
+    _src_tasks = [
+        t for t in _iter_tasks(_docs[0])
+        if isinstance(t.get("ansible.builtin.set_fact"), dict)
+    ]
+    for _var in _url_vars:
+        _assignments = [
+            t["ansible.builtin.set_fact"][_var]
+            for t in _src_tasks if _var in t["ansible.builtin.set_fact"]
+        ]
+        check(
+            f"A3.10b {_fname} defines {_var} exactly once (assignment not "
+            "deleted silently)",
+            len(_assignments) == 1,
+            str(_assignments),
+        )
+        if len(_assignments) == 1:
+            _raw = str(_assignments[0])
+            _derives_hostname = (
+                "LEDGER_HOSTNAME" in _raw
+                or "ASCENDER_HOSTNAME" in _raw
+                or _raw.lstrip().startswith("{{ ledger_ip")
+            )
+            check(
+                f"A3.10b {_fname} {_var} derives from the DNS hostname "
+                "(no ClusterIP / resource-spec source)",
+                _derives_hostname
+                and "clusterIP" not in _raw
+                and "resources[" not in _raw,
+                _raw,
+            )
+
+# ---- A3.6b per-task mode assertions (R2 tests N2): the secret-bearing
+# fork tasks must keep their fail-closed modes — a widened mode must
+# fail the matrix, not silently expose rendered Secret stringData.
+# Matched on the parsed task body (module + dest/path), not task names.
+_common_tasks = (
+    f"{ROOT}/playbooks/roles/common/tasks/main.yml"
+)
+_install_k3s = f"{ROOT}/playbooks/roles/ascender_install/tasks/ascender_install_k3s.yml"
+_tmpdir_tasks = [
+    t for t in _iter_tasks(
+        [d for d in yaml.safe_load_all(open(_common_tasks).read()) if d][0])
+    if isinstance(t.get("ansible.builtin.file"), dict)
+    and "tmp_dir" in str(t["ansible.builtin.file"].get("path", ""))
+    and t["ansible.builtin.file"].get("state") == "directory"
+]
+check("A3.6b common tmp_dir directory task present", len(_tmpdir_tasks) == 1)
+if _tmpdir_tasks:
+    check(
+        "A3.6b common tmp_dir directory mode is 0700",
+        str(_tmpdir_tasks[0]["ansible.builtin.file"].get("mode")) == "0700",
+        str(_tmpdir_tasks[0]["ansible.builtin.file"].get("mode")),
+    )
+_secret_render_tasks = [
+    t for t in _iter_tasks(
+        [d for d in yaml.safe_load_all(open(_install_k3s).read()) if d][0])
+    if isinstance(t.get("ansible.builtin.template"), dict)
+    and "ascender-deployment-k3s.yml" in str(
+        t["ansible.builtin.template"].get("src", ""))
+]
+check(
+    "A3.6b ascender-deployment render task present (secret-bearing)",
+    len(_secret_render_tasks) == 1,
+)
+if _secret_render_tasks:
+    check(
+        "A3.6b ascender-deployment render mode is 0600",
+        str(_secret_render_tasks[0]["ansible.builtin.template"].get("mode"))
+        == "0600",
+        str(_secret_render_tasks[0]["ansible.builtin.template"].get("mode")),
+    )
+
 # ---- A2b3 fail-closed initContainer spec
 init = pod_spec["initContainers"][0]
 check("A2b3 initContainer name", init.get("name") == "verify-mysql-data-mount")
